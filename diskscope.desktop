@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Diskscope
+GenericName=Disk Usage Analyzer
+Comment=See what's using your disk space and clean it up
+Exec=diskscope %F
+Icon=drive-harddisk
+Terminal=false
+Categories=GTK;System;Filesystem;Utility;
+Keywords=disk;storage;space;usage;analyzer;cleanup;du;
+MimeType=inode/directory;
+StartupNotify=true

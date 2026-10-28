@@ -1,0 +1,1211 @@
+#!/usr/bin/env python3
+"""Diskscope — analyze disk usage and free up space.
+
+A native GTK4 + libadwaita disk usage analyzer. Scans a folder or mount,
+shows what takes up space, and deletes items (to Trash or permanently).
+"""
+
+import heapq
+import os
+import re
+import shutil
+import stat
+import sys
+import threading
+import time
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+
+APP_ID = "org.local.Diskscope"
+VERSION = "1.0"
+MAX_ROWS = 1000  # rows shown per folder; the rest are summarized
+TOP_FILES = 300  # length of the "Largest Files" list
+
+HOME = os.path.realpath(os.path.expanduser("~"))
+
+# Never deleted from the UI, no matter what.
+PROTECTED = {
+    "/", "/bin", "/boot", "/dev", "/efi", "/etc", "/home", "/lib", "/lib32",
+    "/lib64", "/media", "/mnt", "/opt", "/proc", "/root", "/run", "/sbin",
+    "/srv", "/sys", "/tmp", "/usr", "/var", "/usr/bin", "/usr/lib",
+    "/usr/lib32", "/usr/lib64", "/usr/local", "/usr/sbin", "/usr/share",
+    "/var/lib", "/var/log", "/var/cache", HOME,
+    os.path.join(HOME, ".config"), os.path.join(HOME, ".local"),
+    os.path.join(HOME, ".local/share"),
+}
+
+# Kernel/virtual trees that are never scanned, even with "one file system" off.
+VIRTUAL_DIRS = {"/proc", "/sys", "/dev", "/run"}
+
+CSS = """
+.size-bar trough, .size-bar progress { min-height: 6px; border-radius: 3px; }
+.usage-bar trough, .usage-bar progress { min-height: 5px; border-radius: 3px; }
+.usage-high progress { background-color: @warning_color; }
+.usage-crit progress { background-color: @error_color; }
+.delete-btn:hover { color: @error_color; }
+.big-size { font-size: 1.8em; font-weight: 800; }
+.crumb { padding: 2px 6px; min-height: 24px; }
+.crumb-sep { opacity: 0.45; }
+"""
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+def fmt_size(n):
+    n = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PiB"
+
+
+def display(s):
+    """Make a filesystem string safe to show (non-UTF-8 names)."""
+    return s.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
+def is_protected(path):
+    ap = os.path.normpath(os.path.abspath(path))
+    if ap in PROTECTED:
+        return True
+    if not os.path.islink(ap):
+        if os.path.realpath(ap) in PROTECTED or os.path.ismount(ap):
+            return True
+    return False
+
+
+class Node:
+    """A file or directory in the scanned tree."""
+
+    __slots__ = ("name", "parent", "size", "count", "is_dir", "children",
+                 "mtime", "note", "deleted")
+
+    def __init__(self, name, parent, is_dir, size=0, mtime=0.0):
+        self.name = name          # full path for the root, basename otherwise
+        self.parent = parent
+        self.size = size          # bytes on disk, including descendants
+        self.count = 0 if is_dir else 1   # number of files beneath
+        self.is_dir = is_dir
+        self.children = [] if is_dir else None
+        self.mtime = mtime
+        self.note = None          # None | "denied" | "mount" | "virtual"
+        self.deleted = False
+
+    def path(self):
+        parts = []
+        n = self
+        while n is not None:
+            parts.append(n.name)
+            n = n.parent
+        return os.path.join(*reversed(parts))
+
+    def label(self):
+        if self.parent is None:
+            return display(os.path.basename(self.name.rstrip("/")) or "/")
+        return display(self.name)
+
+
+def ancestors(node):
+    n = node.parent
+    while n is not None:
+        yield n
+        n = n.parent
+
+
+# --------------------------------------------------------------------------
+# Scanner (runs in a worker thread)
+# --------------------------------------------------------------------------
+
+class Scanner:
+    def __init__(self, root_path, one_fs, on_progress, on_done):
+        self.root_path = os.path.abspath(root_path)
+        self.one_fs = one_fs
+        self.on_progress = on_progress
+        self.on_done = on_done
+        self._cancel = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def cancel(self):
+        self._cancel.set()
+
+    @property
+    def cancelled(self):
+        return self._cancel.is_set()
+
+    def _run(self):
+        t0 = time.monotonic()
+        try:
+            result = self._scan()
+        except OSError as e:
+            GLib.idle_add(self.on_done, self, None, e.strerror or str(e))
+            return
+        if result is not None:
+            result["elapsed"] = time.monotonic() - t0
+        GLib.idle_add(self.on_done, self, result, None)
+
+    def _scan(self):
+        st = os.lstat(self.root_path)
+        if not stat.S_ISDIR(st.st_mode):
+            raise NotADirectoryError(20, "Not a folder", self.root_path)
+        root = Node(self.root_path, None, True, st.st_blocks * 512, st.st_mtime)
+        root_dev = st.st_dev
+        links = {}        # (dev, ino) -> nodes sharing that inode
+        top = []          # min-heap of (size, tiebreak, node)
+        tiebreak = 0
+        dirs = []         # pre-order: every dir comes before its descendants
+        stack = [root]
+        files = errors = 0
+        last = 0.0
+
+        while stack:
+            if self._cancel.is_set():
+                return None
+            d = stack.pop()
+            dirs.append(d)
+            path = d.path()
+            try:
+                with os.scandir(path) as it:
+                    entries = list(it)
+            except OSError:
+                d.note = "denied"
+                errors += 1
+                continue
+
+            for e in entries:
+                try:
+                    est = e.stat(follow_symlinks=False)
+                except OSError:
+                    errors += 1
+                    continue
+                size = est.st_blocks * 512
+                if stat.S_ISDIR(est.st_mode):
+                    child = Node(e.name, d, True, size, est.st_mtime)
+                    d.children.append(child)
+                    full = os.path.join(path, e.name)
+                    if full in VIRTUAL_DIRS:
+                        child.note = "virtual"
+                    elif self.one_fs and est.st_dev != root_dev:
+                        child.note = "mount"
+                    else:
+                        stack.append(child)
+                        continue
+                    d.size += size  # unscanned dir: count only itself
+                else:
+                    group = None
+                    if est.st_nlink > 1:  # count hard-linked data once
+                        group = links.setdefault((est.st_dev, est.st_ino), [])
+                        if group:
+                            size = 0
+                    child = Node(e.name, d, False, size, est.st_mtime)
+                    if group is not None:
+                        group.append(child)
+                    d.children.append(child)
+                    d.size += size
+                    d.count += 1
+                    files += 1
+                    if size:
+                        tiebreak += 1
+                        item = (size, tiebreak, child)
+                        if len(top) < TOP_FILES:
+                            heapq.heappush(top, item)
+                        elif size > top[0][0]:
+                            heapq.heapreplace(top, item)
+
+            now = time.monotonic()
+            if now - last > 0.08:
+                last = now
+                GLib.idle_add(self.on_progress, self, files, len(dirs), path)
+
+        # Roll sizes up: descendants are visited before their ancestors.
+        for d in reversed(dirs):
+            if d.parent is not None:
+                d.parent.size += d.size
+                d.parent.count += d.count
+        for d in dirs:
+            d.children.sort(key=lambda n: n.size, reverse=True)
+
+        largest = [n for _, _, n in sorted(top, key=lambda t: t[0], reverse=True)]
+        return {"root": root, "largest": largest, "files": files,
+                "dirs": len(dirs), "errors": errors,
+                "links": [g for g in links.values() if len(g) > 1]}
+
+
+# --------------------------------------------------------------------------
+# Mounted file systems
+# --------------------------------------------------------------------------
+
+def _unescape_mount(s):
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), s)
+
+
+def list_mounts():
+    mounts = []
+    seen = set()
+    try:
+        with open("/proc/self/mounts") as f:
+            lines = f.readlines()
+    except OSError:
+        return mounts
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        dev, mnt, fstype = parts[0], _unescape_mount(parts[1]), parts[2]
+        if not dev.startswith("/dev/") or dev.startswith("/dev/loop"):
+            continue
+        if mnt in seen:
+            continue
+        try:
+            sv = os.statvfs(mnt)
+        except OSError:
+            continue
+        total = sv.f_blocks * sv.f_frsize
+        if total == 0:
+            continue
+        seen.add(mnt)
+        used = (sv.f_blocks - sv.f_bfree) * sv.f_frsize
+        free = sv.f_bavail * sv.f_frsize
+        mounts.append({"mount": mnt, "device": dev, "fstype": fstype,
+                       "total": total, "used": used, "free": free})
+    mounts.sort(key=lambda m: (m["mount"] != "/", m["mount"]))
+    return mounts
+
+
+# --------------------------------------------------------------------------
+# UI
+# --------------------------------------------------------------------------
+
+class NodeRow(Gtk.ListBoxRow):
+    """One file/folder row: checkbox, icon, name, share bar, size, actions."""
+
+    def __init__(self, win, node, ref_size, show_path):
+        super().__init__()
+        self.node = node
+        self.win = win
+        if show_path:
+            self.set_activatable(True)
+        else:
+            self.set_activatable(node.is_dir)
+
+        box = Gtk.Box(spacing=12, margin_top=6, margin_bottom=6,
+                      margin_start=8, margin_end=6)
+        self.set_child(box)
+
+        self.check = Gtk.CheckButton(valign=Gtk.Align.CENTER,
+                                     tooltip_text="Select for deletion")
+        self.check.set_active(node in win.selection)
+        self.check.connect("toggled", self._on_toggled)
+        box.append(self.check)
+
+        box.append(Gtk.Image.new_from_gicon(self._icon()))
+
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True,
+                       valign=Gtk.Align.CENTER)
+        name = Gtk.Label(label=node.label(), xalign=0,
+                         ellipsize=Pango.EllipsizeMode.MIDDLE)
+        name.set_tooltip_text(display(node.path()))
+        text.append(name)
+        sub = Gtk.Label(label=self._subtitle(show_path), xalign=0,
+                        ellipsize=Pango.EllipsizeMode.START)
+        sub.add_css_class("dim-label")
+        sub.add_css_class("caption")
+        text.append(sub)
+        box.append(text)
+
+        frac = node.size / ref_size if ref_size else 0.0
+        bar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                          valign=Gtk.Align.CENTER)
+        bar = Gtk.ProgressBar(fraction=min(frac, 1.0), width_request=130)
+        bar.add_css_class("size-bar")
+        bar_box.append(bar)
+        pct = Gtk.Label(label=f"{frac * 100:.1f} %", xalign=1)
+        pct.add_css_class("caption")
+        pct.add_css_class("dim-label")
+        pct.add_css_class("numeric")
+        bar_box.append(pct)
+        box.append(bar_box)
+
+        size = Gtk.Label(label=fmt_size(node.size), xalign=1, width_chars=10)
+        size.add_css_class("numeric")
+        size.add_css_class("heading")
+        box.append(size)
+
+        reveal = Gtk.Button(icon_name="folder-open-symbolic",
+                            valign=Gtk.Align.CENTER,
+                            tooltip_text="Show in file manager")
+        reveal.add_css_class("flat")
+        reveal.connect("clicked", lambda *_: win.reveal(node))
+        box.append(reveal)
+
+        delete = Gtk.Button(icon_name="user-trash-symbolic",
+                            valign=Gtk.Align.CENTER, tooltip_text="Delete…")
+        delete.add_css_class("flat")
+        delete.add_css_class("delete-btn")
+        delete.connect("clicked", lambda *_: win.request_delete([node]))
+        box.append(delete)
+
+    def _icon(self):
+        n = self.node
+        if n.is_dir:
+            if n.note == "denied":
+                return Gio.ThemedIcon.new("action-unavailable-symbolic")
+            if n.note in ("mount", "virtual"):
+                return Gio.ThemedIcon.new("drive-harddisk-symbolic")
+            return Gio.ThemedIcon.new("folder-symbolic")
+        ctype, _ = Gio.content_type_guess(display(n.name), None)
+        return Gio.content_type_get_symbolic_icon(ctype)
+
+    def _subtitle(self, show_path):
+        n = self.node
+        if show_path:
+            return display(n.parent.path()) if n.parent else ""
+        if n.is_dir:
+            if n.note == "denied":
+                return "Permission denied — contents not counted"
+            if n.note == "mount":
+                return "Separate file system — click to scan it"
+            if n.note == "virtual":
+                return "System virtual file system — not scanned"
+            return f"{n.count:,} file" + ("" if n.count == 1 else "s")
+        return "Modified " + time.strftime("%Y-%m-%d %H:%M",
+                                           time.localtime(n.mtime))
+
+    def _on_toggled(self, check):
+        self.win.set_selected(self.node, check.get_active())
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Diskscope",
+                         default_width=1150, default_height=740)
+        self.root = None
+        self.current = None
+        self.largest = []
+        self.link_groups = []  # hard-linked files; the first node owns the size
+        self.selection = set()
+        self.scanner = None
+        self.busy = False
+        self.one_fs = True
+        self._busy_toast = None
+        self._rescan_target = None
+
+        self._build_actions()
+
+        self.toasts = Adw.ToastOverlay()
+        self.set_content(self.toasts)
+        split = Adw.NavigationSplitView(min_sidebar_width=250,
+                                        max_sidebar_width=340)
+        self.toasts.set_child(split)
+        split.set_sidebar(self._build_sidebar())
+        split.set_content(self._build_content())
+
+        self.refresh_mounts()
+        self.connect("close-request", self._on_close)
+
+    # ---- construction -----------------------------------------------------
+
+    def _build_actions(self):
+        def add(name, cb):
+            a = Gio.SimpleAction.new(name, None)
+            a.connect("activate", cb)
+            self.add_action(a)
+            return a
+
+        self.act_up = add("up", lambda *_: self.go_up())
+        self.act_rescan = add("rescan", lambda *_: self.rescan())
+        add("open", lambda *_: self.choose_folder())
+        add("delete", lambda *_: self.delete_shortcut())
+        add("about", lambda *_: self.show_about())
+        self.act_up.set_enabled(False)
+        self.act_rescan.set_enabled(False)
+
+        one_fs = Gio.SimpleAction.new_stateful(
+            "one-fs", None, GLib.Variant.new_boolean(True))
+        one_fs.connect("change-state", self._on_one_fs)
+        self.add_action(one_fs)
+
+    def _build_sidebar(self):
+        tv = Adw.ToolbarView()
+        hb = Adw.HeaderBar()
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic",
+                             tooltip_text="Refresh drives")
+        refresh.connect("clicked", lambda *_: self.refresh_mounts())
+        hb.pack_end(refresh)
+        tv.add_top_bar(hb)
+
+        self.places = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.places.add_css_class("navigation-sidebar")
+        self.places.connect("row-activated",
+                            lambda _lb, row: self.start_scan(row.scan_path))
+        sw = Gtk.ScrolledWindow(vexpand=True, child=self.places,
+                                hscrollbar_policy=Gtk.PolicyType.NEVER)
+        tv.set_content(sw)
+
+        bottom = Gtk.Box(margin_top=6, margin_bottom=6, margin_start=6,
+                         margin_end=6)
+        choose = Gtk.Button(hexpand=True, action_name="win.open")
+        choose.set_child(Adw.ButtonContent(icon_name="folder-open-symbolic",
+                                           label="Choose Folder…"))
+        bottom.append(choose)
+        tv.add_bottom_bar(bottom)
+        return Adw.NavigationPage.new(tv, "Locations")
+
+    def _build_content(self):
+        tv = Adw.ToolbarView()
+
+        hb = Adw.HeaderBar()
+        up = Gtk.Button(icon_name="go-up-symbolic", action_name="win.up",
+                        tooltip_text="Parent folder (Alt+Up)")
+        hb.pack_start(up)
+
+        menu = Gio.Menu()
+        menu.append("Stay on One File System", "win.one-fs")
+        menu.append("About Diskscope", "win.about")
+        hb.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic",
+                                   menu_model=menu, primary=True,
+                                   tooltip_text="Main menu"))
+        hb.pack_end(Gtk.Button(icon_name="view-refresh-symbolic",
+                               action_name="win.rescan",
+                               tooltip_text="Rescan (F5)"))
+
+        self.view_stack = Adw.ViewStack()
+        self.title_stack = Gtk.Stack()
+        self.title_stack.add_named(Adw.WindowTitle(title="Diskscope"), "plain")
+        self.title_stack.add_named(
+            Adw.ViewSwitcher(stack=self.view_stack,
+                             policy=Adw.ViewSwitcherPolicy.WIDE), "switcher")
+        hb.set_title_widget(self.title_stack)
+        tv.add_top_bar(hb)
+
+        # Breadcrumbs
+        self.crumbs = Gtk.Box(spacing=2, margin_start=10, margin_end=10,
+                              margin_top=4, margin_bottom=4)
+        self.crumb_bar = Gtk.ScrolledWindow(
+            child=self.crumbs, vscrollbar_policy=Gtk.PolicyType.NEVER,
+            visible=False)
+        tv.add_top_bar(self.crumb_bar)
+
+        # Main stack: empty / scanning / results
+        self.main_stack = Gtk.Stack(
+            transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.main_stack.add_named(self._build_empty(), "empty")
+        self.main_stack.add_named(self._build_scanning(), "scanning")
+        self.main_stack.add_named(self.view_stack, "results")
+        tv.set_content(self.main_stack)
+
+        self.view_stack.add_titled_with_icon(
+            self._build_folder_page(), "folders", "Folders", "folder-symbolic")
+        self.view_stack.add_titled_with_icon(
+            self._build_largest_page(), "largest", "Largest Files",
+            "view-list-symbolic")
+        self.view_stack.connect("notify::visible-child-name",
+                                lambda *_: self._sync_chrome())
+
+        # Selection action bar
+        self.action_bar = Gtk.ActionBar(revealed=False)
+        self.sel_label = Gtk.Label()
+        self.sel_label.add_css_class("numeric")
+        self.action_bar.pack_start(self.sel_label)
+        del_btn = Gtk.Button(label="Delete Selected…")
+        del_btn.add_css_class("destructive-action")
+        del_btn.connect("clicked",
+                        lambda *_: self.request_delete(list(self.selection)))
+        self.action_bar.pack_end(del_btn)
+        clear = Gtk.Button(label="Clear Selection")
+        clear.connect("clicked", lambda *_: self.clear_selection())
+        self.action_bar.pack_end(clear)
+        tv.add_bottom_bar(self.action_bar)
+
+        return Adw.NavigationPage.new(tv, "Diskscope")
+
+    def _build_empty(self):
+        page = Adw.StatusPage(
+            icon_name="drive-harddisk-symbolic", title="Analyze Disk Usage",
+            description="Pick a drive on the left, or scan any folder to see "
+                        "what is using your space.")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                      halign=Gtk.Align.CENTER)
+        home = Gtk.Button(label="Scan Home Folder")
+        home.add_css_class("pill")
+        home.add_css_class("suggested-action")
+        home.connect("clicked", lambda *_: self.start_scan(HOME))
+        box.append(home)
+        other = Gtk.Button(label="Choose Folder…", action_name="win.open")
+        other.add_css_class("pill")
+        box.append(other)
+        page.set_child(box)
+        return page
+
+    def _build_scanning(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14,
+                      valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER,
+                      margin_start=24, margin_end=24)
+        box.append(Adw.Spinner(width_request=48, height_request=48))
+        self.scan_title = Gtk.Label(label="Scanning…")
+        self.scan_title.add_css_class("title-2")
+        box.append(self.scan_title)
+        self.scan_counts = Gtk.Label()
+        self.scan_counts.add_css_class("numeric")
+        box.append(self.scan_counts)
+        self.scan_path = Gtk.Label(ellipsize=Pango.EllipsizeMode.MIDDLE,
+                                   max_width_chars=70, width_chars=40)
+        self.scan_path.add_css_class("dim-label")
+        self.scan_path.add_css_class("caption")
+        box.append(self.scan_path)
+        cancel = Gtk.Button(label="Cancel", halign=Gtk.Align.CENTER)
+        cancel.add_css_class("pill")
+        cancel.connect("clicked", lambda *_: self.cancel_scan())
+        box.append(cancel)
+        return box
+
+    def _build_folder_page(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        head = Gtk.Box(spacing=12, margin_start=18, margin_end=18,
+                       margin_top=14, margin_bottom=10)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True,
+                       valign=Gtk.Align.CENTER)
+        self.dir_title = Gtk.Label(xalign=0,
+                                   ellipsize=Pango.EllipsizeMode.MIDDLE)
+        self.dir_title.add_css_class("title-2")
+        text.append(self.dir_title)
+        self.dir_sub = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.dir_sub.add_css_class("dim-label")
+        text.append(self.dir_sub)
+        head.append(text)
+        self.dir_size = Gtk.Label(valign=Gtk.Align.CENTER)
+        self.dir_size.add_css_class("big-size")
+        self.dir_size.add_css_class("numeric")
+        head.append(self.dir_size)
+        outer.append(head)
+
+        self.folder_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE,
+                                       valign=Gtk.Align.START)
+        self.folder_list.add_css_class("boxed-list")
+        self.folder_list.connect("row-activated", self._on_folder_row)
+        self.folder_scroll = self._clamped_scroll(self.folder_list)
+        outer.append(self.folder_scroll)
+        return outer
+
+    def _build_largest_page(self):
+        self.largest_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE,
+                                        valign=Gtk.Align.START)
+        self.largest_list.add_css_class("boxed-list")
+        self.largest_list.connect("row-activated", self._on_largest_row)
+        self.largest_scroll = self._clamped_scroll(self.largest_list,
+                                                   top_margin=14)
+        return self.largest_scroll
+
+    def _clamped_scroll(self, child, top_margin=0):
+        clamp = Adw.Clamp(maximum_size=1100, child=child,
+                          margin_start=12, margin_end=12,
+                          margin_top=top_margin, margin_bottom=18)
+        return Gtk.ScrolledWindow(vexpand=True, child=clamp,
+                                  hscrollbar_policy=Gtk.PolicyType.NEVER)
+
+    # ---- sidebar ------------------------------------------------------------
+
+    def refresh_mounts(self):
+        self.places.remove_all()
+        self.places.append(self._place_row("user-home-symbolic", "Home",
+                                           display(HOME), HOME, None))
+        for m in list_mounts():
+            title = "File System" if m["mount"] == "/" else \
+                display(os.path.basename(m["mount"]) or m["mount"])
+            self.places.append(self._place_row(
+                "drive-harddisk-symbolic", title,
+                f'{display(m["mount"])} · {m["fstype"]}', m["mount"], m))
+
+    def _place_row(self, icon, title, subtitle, path, mount):
+        row = Gtk.ListBoxRow()
+        row.scan_path = path
+        row.set_tooltip_text(f"Scan {display(path)}")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                      margin_top=6, margin_bottom=6, margin_start=4,
+                      margin_end=4)
+        top = Gtk.Box(spacing=10)
+        top.append(Gtk.Image(icon_name=icon))
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+        lbl = Gtk.Label(label=title, xalign=0,
+                        ellipsize=Pango.EllipsizeMode.END)
+        text.append(lbl)
+        sub = Gtk.Label(label=subtitle, xalign=0,
+                        ellipsize=Pango.EllipsizeMode.MIDDLE)
+        sub.add_css_class("caption")
+        sub.add_css_class("dim-label")
+        text.append(sub)
+        top.append(text)
+        box.append(top)
+        if mount:
+            frac = mount["used"] / mount["total"]
+            bar = Gtk.ProgressBar(fraction=frac)
+            bar.add_css_class("usage-bar")
+            if frac >= 0.95:
+                bar.add_css_class("usage-crit")
+            elif frac >= 0.85:
+                bar.add_css_class("usage-high")
+            box.append(bar)
+            info = Gtk.Label(
+                label=f'{fmt_size(mount["free"])} free of '
+                      f'{fmt_size(mount["total"])}', xalign=0)
+            info.add_css_class("caption")
+            info.add_css_class("numeric")
+            box.append(info)
+        row.set_child(box)
+        return row
+
+    # ---- scanning -------------------------------------------------------------
+
+    def start_scan(self, path):
+        if self.busy:
+            return
+        if self.scanner:
+            self.scanner.cancel()
+        self.clear_selection()
+        self.scan_title.set_label(f"Scanning {display(path)}")
+        self.scan_counts.set_label("Starting…")
+        self.scan_path.set_label("")
+        self.main_stack.set_visible_child_name("scanning")
+        self._sync_chrome()
+        self.scanner = Scanner(path, self.one_fs, self._on_scan_progress,
+                               self._on_scan_done)
+        self.scanner.start()
+
+    def cancel_scan(self):
+        if self.scanner:
+            self.scanner.cancel()
+            self.scanner = None
+        self.main_stack.set_visible_child_name(
+            "results" if self.root else "empty")
+        self._sync_chrome()
+
+    def rescan(self):
+        if self.root:
+            path = self.current.path() if self.current else self.root.path()
+            self._rescan_target = path
+            self.start_scan(self.root.path())
+
+    def _on_scan_progress(self, scanner, files, dirs, path):
+        if scanner is self.scanner:
+            self.scan_counts.set_label(f"{files:,} files · {dirs:,} folders")
+            self.scan_path.set_label(display(path))
+        return False
+
+    def _on_scan_done(self, scanner, result, error):
+        if scanner is not self.scanner:
+            return False
+        self.scanner = None
+        if error:
+            self.toast(f"Could not scan: {error}")
+            self.main_stack.set_visible_child_name(
+                "results" if self.root else "empty")
+            self._sync_chrome()
+            return False
+        if result is None:  # cancelled
+            return False
+
+        self.root = result["root"]
+        self.largest = result["largest"]
+        self.link_groups = result["links"]
+        target = self._rescan_target
+        self._rescan_target = None
+        self.current = self._find(target) if target else self.root
+        self.main_stack.set_visible_child_name("results")
+        self.view_stack.set_visible_child_name("folders")
+        self.refresh_views()
+
+        msg = (f'Scanned {result["files"]:,} files in '
+               f'{result["elapsed"]:.1f} s')
+        if result["errors"]:
+            msg += f' · {result["errors"]:,} items unreadable'
+        self.toast(msg)
+        return False
+
+    def _find(self, path):
+        """Locate the node for path in the current tree (falls back to root)."""
+        rel = os.path.relpath(path, self.root.path())
+        node = self.root
+        if rel == ".":
+            return node
+        for part in rel.split(os.sep):
+            nxt = next((c for c in node.children or () if c.name == part), None)
+            if nxt is None or not nxt.is_dir:
+                break
+            node = nxt
+        return node
+
+    def _on_one_fs(self, action, value):
+        action.set_state(value)
+        self.one_fs = value.get_boolean()
+
+    # ---- views ------------------------------------------------------------------
+
+    def refresh_views(self):
+        self._fill_folder()
+        self._fill_largest()
+        self._fill_crumbs()
+        self._sync_chrome()
+
+    def _sync_chrome(self):
+        results = self.main_stack.get_visible_child_name() == "results"
+        folders = self.view_stack.get_visible_child_name() == "folders"
+        self.title_stack.set_visible_child_name(
+            "switcher" if results else "plain")
+        self.crumb_bar.set_visible(results and folders)
+        self.act_up.set_enabled(bool(results and folders and self.current
+                                     and self.current.parent))
+        self.act_rescan.set_enabled(self.root is not None and not self.busy)
+
+    def _keep_scroll(self, scroller, fill):
+        adj = scroller.get_vadjustment()
+        value = adj.get_value()
+        fill()
+        GLib.idle_add(lambda: adj.set_value(value) and False)
+
+    def _fill_folder(self, keep_scroll=False):
+        def fill():
+            d = self.current
+            self.folder_list.remove_all()
+            self.dir_title.set_label(d.label())
+            sub = f"{display(d.path())} · {d.count:,} files"
+            if d.parent is not None and self.root.size:
+                sub += f" · {d.size / self.root.size * 100:.1f} % of scan"
+            self.dir_sub.set_label(sub)
+            self.dir_size.set_label(fmt_size(d.size))
+
+            kids = d.children or []
+            if not kids:
+                empty = Adw.ActionRow(
+                    title="This folder is empty" if d.note is None
+                    else "Contents could not be read",
+                    activatable=False)
+                self.folder_list.append(empty)
+                return
+            for child in kids[:MAX_ROWS]:
+                self.folder_list.append(NodeRow(self, child, d.size, False))
+            rest = kids[MAX_ROWS:]
+            if rest:
+                self.folder_list.append(Adw.ActionRow(
+                    title=f"… and {len(rest):,} smaller items",
+                    subtitle=fmt_size(sum(n.size for n in rest)) + " in total",
+                    activatable=False))
+
+        if keep_scroll:
+            self._keep_scroll(self.folder_scroll, fill)
+        else:
+            fill()
+            self.folder_scroll.get_vadjustment().set_value(0)
+
+    def _fill_largest(self, keep_scroll=False):
+        def fill():
+            self.largest_list.remove_all()
+            self.largest = [n for n in self.largest if self.alive(n)]
+            if not self.largest:
+                self.largest_list.append(Adw.ActionRow(
+                    title="No files found", activatable=False))
+                return
+            for n in self.largest:
+                self.largest_list.append(
+                    NodeRow(self, n, self.root.size, True))
+
+        if keep_scroll:
+            self._keep_scroll(self.largest_scroll, fill)
+        else:
+            fill()
+
+    def _fill_crumbs(self):
+        child = self.crumbs.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self.crumbs.remove(child)
+            child = nxt
+        chain = [self.current] + list(ancestors(self.current))
+        chain.reverse()
+        for i, node in enumerate(chain):
+            last = i == len(chain) - 1
+            label = display(node.name) if node.parent is None else node.label()
+            if i:
+                sep = Gtk.Label(label="›")
+                sep.add_css_class("crumb-sep")
+                self.crumbs.append(sep)
+            btn = Gtk.Button(label=label, sensitive=not last)
+            btn.add_css_class("flat")
+            btn.add_css_class("crumb")
+            if last:
+                btn.add_css_class("heading")
+            btn.connect("clicked", lambda _b, n=node: self.navigate(n))
+            self.crumbs.append(btn)
+        GLib.idle_add(self._scroll_crumbs_end)
+
+    def _scroll_crumbs_end(self):
+        adj = self.crumb_bar.get_hadjustment()
+        adj.set_value(adj.get_upper())
+        return False
+
+    def navigate(self, node):
+        self.current = node
+        self._fill_folder()
+        self._fill_crumbs()
+        self._sync_chrome()
+
+    def go_up(self):
+        if self.current and self.current.parent:
+            prev = self.current
+            self.navigate(self.current.parent)
+            for row in self._rows(self.folder_list):
+                if row.node is prev:
+                    row.grab_focus()
+                    break
+
+    def _on_folder_row(self, _lb, row):
+        n = getattr(row, "node", None)
+        if n is None or not n.is_dir:
+            return
+        if n.note == "mount":
+            self.start_scan(n.path())
+        elif n.note is None:
+            self.navigate(n)
+
+    def _on_largest_row(self, _lb, row):
+        n = getattr(row, "node", None)
+        if n is None or n.parent is None:
+            return
+        self.view_stack.set_visible_child_name("folders")
+        self.navigate(n.parent)
+        for r in self._rows(self.folder_list):
+            if r.node is n:
+                r.grab_focus()
+                break
+
+    @staticmethod
+    def _rows(listbox):
+        row = listbox.get_first_child()
+        while row:
+            if isinstance(row, NodeRow):
+                yield row
+            row = row.get_next_sibling()
+
+    # ---- selection ----------------------------------------------------------------
+
+    def set_selected(self, node, on):
+        if on:
+            self.selection.add(node)
+        else:
+            self.selection.discard(node)
+        self._sync_selection()
+
+    def clear_selection(self):
+        self.selection.clear()
+        for lb in (self.folder_list, self.largest_list):
+            for row in self._rows(lb):
+                row.check.set_active(False)
+        self._sync_selection()
+
+    def _sync_selection(self):
+        sel = self._prune(self.selection)
+        if sel:
+            total = sum(n.size for n in sel)
+            self.sel_label.set_label(
+                f"{len(sel):,} selected · {fmt_size(total)}")
+        self.action_bar.set_revealed(bool(sel))
+
+    def _prune(self, nodes):
+        """Drop dead nodes and nodes whose ancestor is also in the set."""
+        nodes = {n for n in nodes if self.alive(n)}
+        return [n for n in nodes if not any(a in nodes for a in ancestors(n))]
+
+    def alive(self, node):
+        n = node
+        while n.parent is not None:
+            if n.deleted:
+                return False
+            n = n.parent
+        return n is self.root
+
+    # ---- deletion ---------------------------------------------------------------------
+
+    def delete_shortcut(self):
+        if self.main_stack.get_visible_child_name() != "results":
+            return
+        if self.selection:
+            self.request_delete(list(self.selection))
+            return
+        w = self.get_focus()
+        while w is not None and not isinstance(w, NodeRow):
+            w = w.get_parent()
+        if w is not None:
+            self.request_delete([w.node])
+
+    def request_delete(self, nodes):
+        if self.busy:
+            return
+        nodes = self._prune(nodes)
+        if not nodes:
+            return
+        for n in nodes:
+            if n.parent is None or is_protected(n.path()):
+                self.toast(f"“{display(n.path())}” is a protected location "
+                           "and can't be deleted from here")
+                return
+        nodes.sort(key=lambda n: n.size, reverse=True)
+        total = sum(n.size for n in nodes)
+
+        if len(nodes) == 1:
+            n = nodes[0]
+            kind = "Folder" if n.is_dir else "File"
+            heading = f"Delete {kind}?"
+            body = f"{display(n.path())}\n\n{fmt_size(n.size)}"
+            if n.is_dir:
+                body += f" · {n.count:,} files"
+        else:
+            heading = f"Delete {len(nodes)} Items?"
+            shown = "\n".join(f"• {n.label()}  ({fmt_size(n.size)})"
+                              for n in nodes[:8])
+            if len(nodes) > 8:
+                shown += f"\n• … and {len(nodes) - 8} more"
+            body = f"{shown}\n\nTotal: {fmt_size(total)}"
+        body += ("\n\nMove to Trash lets you restore later. "
+                 "Delete Permanently cannot be undone.")
+
+        dlg = Adw.AlertDialog(heading=heading, body=body)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("trash", "Move to Trash")
+        dlg.add_response("delete", "Delete Permanently")
+        dlg.set_response_appearance("trash", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_response_appearance("delete",
+                                    Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("trash")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", self._on_delete_response, nodes)
+        dlg.present(self)
+
+    def _on_delete_response(self, _dlg, response, nodes):
+        if response not in ("trash", "delete"):
+            return
+        permanent = response == "delete"
+        items = [(n, n.path()) for n in nodes]
+        self.busy = True
+        self.main_stack.set_sensitive(False)
+        self._sync_chrome()
+        verb = "Deleting" if permanent else "Moving to Trash"
+        self._busy_toast = Adw.Toast(title=f"{verb} {len(items)} item(s)…",
+                                     timeout=0)
+        self.toasts.add_toast(self._busy_toast)
+        threading.Thread(target=self._delete_worker,
+                         args=(items, permanent), daemon=True).start()
+
+    def _delete_worker(self, items, permanent):
+        results = []
+        for node, path in items:
+            try:
+                if permanent:
+                    if os.path.isdir(path) and not os.path.islink(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.unlink(path)
+                else:
+                    Gio.File.new_for_path(path).trash(None)
+                results.append((node, path, None))
+            except GLib.Error as e:
+                results.append((node, path, e.message))
+            except OSError as e:
+                results.append((node, path, e.strerror or str(e)))
+        GLib.idle_add(self._on_deleted, results, permanent)
+
+    def _on_deleted(self, results, permanent):
+        self.busy = False
+        self.main_stack.set_sensitive(True)
+        if self._busy_toast:
+            self._busy_toast.dismiss()
+            self._busy_toast = None
+
+        before = self.root.size
+        done = 0
+        partial = False
+        failures = []
+        for node, path, err in results:
+            self.selection.discard(node)
+            if err is None:
+                done += 1
+                self._remove_node(node)
+            elif os.path.lexists(path):
+                failures.append((path, err))
+                if node.is_dir:
+                    partial = True
+            else:  # vanished anyway
+                done += 1
+                self._remove_node(node)
+
+        self._reassign_links()
+        freed = before - self.root.size
+
+        if not self.alive(self.current):
+            n = self.current
+            while not self.alive(n):
+                n = n.parent
+            self.current = n
+
+        self._fill_folder(keep_scroll=True)
+        self._fill_largest(keep_scroll=True)
+        self._fill_crumbs()
+        self._sync_selection()
+        self._sync_chrome()
+        self.refresh_mounts()
+
+        if done:
+            where = "Deleted" if permanent else "Moved to Trash:"
+            self.toast(f"{where} {done} item(s) · {fmt_size(freed)} "
+                       + ("freed" if permanent else "(empty Trash to free it)"))
+        if failures:
+            path, err = failures[0]
+            more = f" (+{len(failures) - 1} more)" if len(failures) > 1 else ""
+            msg = f"Couldn't delete {display(os.path.basename(path))}: {err}{more}"
+            if partial:
+                msg += " — some contents may be gone, rescan to refresh"
+            elif not permanent and "not supported" in err:
+                msg += " — use Delete Permanently instead"
+            self.toast(msg, timeout=8)
+        return False
+
+    def _reassign_links(self):
+        """Deleting one name of a hard-linked file frees nothing while other
+        names remain, so hand the counted size to a surviving link."""
+        groups = []
+        for group in self.link_groups:
+            alive = [n for n in group if self.alive(n)]
+            if not alive:
+                continue
+            if alive[0] is not group[0]:  # the counted name was deleted
+                heir = alive[0]
+                heir.size = group[0].size
+                for a in ancestors(heir):
+                    a.size += heir.size
+                heir.parent.children.sort(key=lambda n: n.size, reverse=True)
+                self.largest.append(heir)
+            if len(alive) > 1:
+                groups.append(alive)
+        self.largest.sort(key=lambda n: n.size, reverse=True)
+        del self.largest[TOP_FILES:]
+        self.link_groups = groups
+
+    def _remove_node(self, node):
+        parent = node.parent
+        if parent is None or node.deleted:
+            return
+        try:
+            parent.children.remove(node)
+        except ValueError:
+            return
+        node.deleted = True
+        a = parent
+        while a is not None:
+            a.size -= node.size
+            a.count -= node.count
+            a = a.parent
+
+    # ---- misc ------------------------------------------------------------------------
+
+    def reveal(self, node):
+        launcher = Gtk.FileLauncher(file=Gio.File.new_for_path(node.path()))
+
+        def done(l, res):
+            try:
+                l.open_containing_folder_finish(res)
+            except GLib.Error as e:
+                self.toast(f"Couldn't open file manager: {e.message}")
+
+        launcher.open_containing_folder(self, None, done)
+
+    def choose_folder(self):
+        dlg = Gtk.FileDialog(title="Choose a Folder to Scan")
+        dlg.set_initial_folder(Gio.File.new_for_path(
+            self.root.path() if self.root else HOME))
+
+        def done(d, res):
+            try:
+                f = d.select_folder_finish(res)
+            except GLib.Error:
+                return
+            if f and f.get_path():
+                self.start_scan(f.get_path())
+
+        dlg.select_folder(self, None, done)
+
+    def show_about(self):
+        Adw.AboutDialog(
+            application_name="Diskscope", version=VERSION,
+            application_icon="drive-harddisk",
+            comments="See what's using your disk space and clean it up.",
+            license_type=Gtk.License.MIT_X11).present(self)
+
+    def toast(self, text, timeout=4):
+        self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(text),
+                                        timeout=timeout))
+
+    def _on_close(self, *_):
+        if self.scanner:
+            self.scanner.cancel()
+        return False
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID,
+                         flags=Gio.ApplicationFlags.HANDLES_OPEN)
+        self.add_main_option("version", ord("v"), GLib.OptionFlags.NONE,
+                             GLib.OptionArg.NONE, "Show version", None)
+
+    def do_handle_local_options(self, options):
+        if options.contains("version"):
+            print(f"Diskscope {VERSION}")
+            return 0
+        return -1
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        provider = Gtk.CssProvider()
+        provider.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        quit_ = Gio.SimpleAction.new("quit", None)
+        quit_.connect("activate", lambda *_: self.quit())
+        self.add_action(quit_)
+        self.set_accels_for_action("app.quit", ["<Ctrl>q"])
+        self.set_accels_for_action("win.up", ["<Alt>Up", "BackSpace"])
+        self.set_accels_for_action("win.rescan", ["F5", "<Ctrl>r"])
+        self.set_accels_for_action("win.open", ["<Ctrl>o"])
+        self.set_accels_for_action("win.delete", ["Delete"])
+
+    def _window(self):
+        win = self.get_active_window()
+        if win is None:
+            win = Window(self)
+        return win
+
+    def do_activate(self):
+        self._window().present()
+
+    def do_open(self, files, _n, _hint):
+        win = self._window()
+        win.present()
+        if files and files[0].get_path():
+            win.start_scan(files[0].get_path())
+
+
+def main():
+    return App().run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
